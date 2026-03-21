@@ -1,4 +1,5 @@
 import Cocoa
+import os.proc
 import UserNotifications
 
 /// Service that manages proactive assistants - screen monitoring, frame capture, and assistant coordination
@@ -38,6 +39,11 @@ public class ProactiveAssistantsPlugin: NSObject {
     // encoding is slower than the capture rate — the primary cause of multi-GB memory growth.
     private(set) var isProcessingRewindFrame = false
     private(set) var droppedFrameCount = 0
+
+    // Memory pressure: skip frame capture entirely when available memory is critically low.
+    // 200 MB threshold — below this the system is under severe pressure and we should shed load.
+    private let memoryPressureThresholdBytes: UInt64 = 200 * 1024 * 1024
+    private var memoryPressureDropCount = 0
 
     /// Periodic screen recording permission recheck interval (60 seconds).
     /// Detects permission revocation while monitoring is active (issue #5792).
@@ -473,6 +479,7 @@ public class ProactiveAssistantsPlugin: NSObject {
             log("RewindBackpressure: Session total dropped frames: \(droppedFrameCount)")
         }
         droppedFrameCount = 0
+        memoryPressureDropCount = 0
         currentApp = nil
         currentWindowID = nil
         currentWindowTitle = nil
@@ -665,6 +672,21 @@ public class ProactiveAssistantsPlugin: NSObject {
 
         // Use real app name from window info, fall back to cached if unavailable
         let appName = realAppName ?? currentApp
+
+        // Memory pressure guard: skip frame entirely when system memory is critically low.
+        // This prevents the capture pipeline from making an OOM situation worse.
+        let availableMemory = os_proc_available_memory()
+        if availableMemory > 0 && availableMemory < memoryPressureThresholdBytes {
+            memoryPressureDropCount += 1
+            if memoryPressureDropCount == 1 || memoryPressureDropCount % 30 == 0 {
+                log("MemoryPressure: Skipping frame capture (available: \(availableMemory / 1024 / 1024)MB, threshold: \(memoryPressureThresholdBytes / 1024 / 1024)MB, total skipped: \(memoryPressureDropCount))")
+            }
+            return
+        }
+        if memoryPressureDropCount > 0 {
+            log("MemoryPressure: Recovered — available memory \(availableMemory / 1024 / 1024)MB, resuming capture after \(memoryPressureDropCount) skipped frames")
+            memoryPressureDropCount = 0
+        }
 
         // Always capture frames (other features may need them)
         // macOS 14+: capture CGImage directly, encode JPEG once for assistants,
