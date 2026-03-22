@@ -45,6 +45,14 @@ public class ProactiveAssistantsPlugin: NSObject {
     private let memoryPressureThresholdBytes: UInt64 = 200 * 1024 * 1024
     private var memoryPressureDropCount = 0
 
+    // Hard cap on concurrent captureFrame invocations to prevent 2-3GB memory spikes.
+    // CGImages (~24MB each) accumulate when OCR/distribution is slow and the timer keeps firing
+    // new async Tasks that each hold a frame at an await point. Skipping the entire captureFrame
+    // (before any allocation) is the only way to bound this regardless of downstream speed.
+    private var pendingFrameCount = 0
+    private let maxPendingFrames = 10
+    private(set) var droppedFrameCapCount = 0
+
     /// Periodic screen recording permission recheck interval (60 seconds).
     /// Detects permission revocation while monitoring is active (issue #5792).
     private var lastPermissionCheckTime: Date = .distantPast
@@ -475,11 +483,16 @@ public class ProactiveAssistantsPlugin: NSObject {
         isMonitoring = false
         isStartingMonitoring = false  // Reset in case stop was called during startup
         isProcessingRewindFrame = false
+        pendingFrameCount = 0
         if droppedFrameCount > 0 {
             log("RewindBackpressure: Session total dropped frames: \(droppedFrameCount)")
         }
         droppedFrameCount = 0
         memoryPressureDropCount = 0
+        if droppedFrameCapCount > 0 {
+            log("FrameCapBackpressure: Session total dropped frames: \(droppedFrameCapCount)")
+        }
+        droppedFrameCapCount = 0
         currentApp = nil
         currentWindowID = nil
         currentWindowTitle = nil
@@ -587,6 +600,19 @@ public class ProactiveAssistantsPlugin: NSObject {
 
     private func captureFrame() async {
         guard isMonitoring, let screenCaptureService = screenCaptureService else { return }
+
+        // Hard cap: skip entire frame if too many are already in-flight through the
+        // distribution/OCR pipeline. Each queued frame holds a CGImage (~24MB), so without
+        // this cap a slow OCR pass causes 2-3GB spikes regardless of the RewindIndexer gate.
+        guard pendingFrameCount < maxPendingFrames else {
+            droppedFrameCapCount += 1
+            if droppedFrameCapCount == 1 || droppedFrameCapCount % 30 == 0 {
+                log("FrameCapBackpressure: \(pendingFrameCount) frames pending (cap=\(maxPendingFrames)), dropped \(droppedFrameCapCount) total")
+            }
+            return
+        }
+        pendingFrameCount += 1
+        defer { pendingFrameCount -= 1 }
 
         // Periodic screen recording permission recheck (issue #5792).
         // Detects when the user revokes permission via System Settings while monitoring is active,
