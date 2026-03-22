@@ -174,11 +174,20 @@ actor RewindOCRService {
                     return
                 }
 
+                guard !observations.isEmpty else {
+                    continuation.resume(returning: OCRResult(fullText: "", blocks: [], processedAt: Date()))
+                    return
+                }
+
                 var blocks: [OCRTextBlock] = []
                 var fullTextLines: [String] = []
 
                 for observation in observations {
-                    guard let candidate = observation.topCandidates(1).first else { continue }
+                    // topCandidates can crash internally on invalid observation state;
+                    // request count 0 first as a safe probe, then request 1 only if non-empty.
+                    guard !observation.topCandidates(0).isEmpty else { continue }
+                    let candidates = observation.topCandidates(1)
+                    guard let candidate = candidates.first else { continue }
 
                     let boundingBox = observation.boundingBox
                     let block = OCRTextBlock(
